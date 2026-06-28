@@ -69,6 +69,7 @@ export const INITIAL_STATE: GameState = {
 };
 
 export const PRESTIGE_THRESHOLD = 1_000_000;
+export const SAVE_VERSION = 2;
 
 export function costOf(def: UpgradeDef, owned: number): number {
   return Math.ceil(def.baseCost * Math.pow(1.15, owned));
@@ -98,6 +99,27 @@ export function computeCps(state: GameState): number {
     cps += def.baseCps * state.upgrades[def.id];
   }
   return cps * cpsMult;
+}
+
+export interface CpsContribution {
+  id: UpgradeId;
+  name: string;
+  icon: string;
+  count: number;
+  cps: number;
+  share: number;
+}
+
+export function cpsBreakdown(state: GameState): CpsContribution[] {
+  const { cpsMult } = computeMultipliers(state);
+  const rows = UPGRADES.map((def) => {
+    const count = state.upgrades[def.id];
+    const cps = def.baseCps * count * cpsMult;
+    return { id: def.id, name: def.name, icon: def.icon, count, cps, share: 0 };
+  });
+  const total = rows.reduce((acc, r) => acc + r.cps, 0);
+  if (total > 0) for (const r of rows) r.share = r.cps / total;
+  return rows.filter((r) => r.count > 0).sort((a, b) => b.cps - a.cps);
 }
 
 export function computeClickPower(state: GameState): number {
@@ -151,4 +173,101 @@ export function saveState(state: GameState) {
 export function resetSave() {
   if (typeof window === "undefined") return;
   localStorage.removeItem(SAVE_KEY);
+}
+
+// ─── Save slots & backup ────────────────────────────────────────────────
+
+export interface SavePayload {
+  version: number;
+  savedAt: number;
+  label?: string;
+  state: GameState;
+  achievements: string[];
+  achievementsTs: Record<string, number>;
+  startTime: number;
+}
+
+export const NUM_SLOTS = 3;
+const SLOT_KEY = (i: number) => `cosmic-singularity-slot-${i}-v1`;
+const BACKUP_KEY = "cosmic-singularity-backup-v1";
+
+export interface SlotInfo {
+  index: number;
+  payload: SavePayload | null;
+}
+
+export function listSlots(): SlotInfo[] {
+  const out: SlotInfo[] = [];
+  for (let i = 0; i < NUM_SLOTS; i++) {
+    out.push({ index: i, payload: readSlot(i) });
+  }
+  return out;
+}
+
+export function readSlot(i: number): SavePayload | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(SLOT_KEY(i));
+    if (!raw) return null;
+    return JSON.parse(raw) as SavePayload;
+  } catch {
+    return null;
+  }
+}
+
+export function writeSlot(i: number, payload: Omit<SavePayload, "version" | "savedAt"> & { label?: string }) {
+  if (typeof window === "undefined") return;
+  const full: SavePayload = { ...payload, version: SAVE_VERSION, savedAt: Date.now() };
+  try {
+    localStorage.setItem(SLOT_KEY(i), JSON.stringify(full));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function deleteSlot(i: number) {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(SLOT_KEY(i));
+}
+
+export function snapshotBackup(payload: Omit<SavePayload, "version" | "savedAt">) {
+  if (typeof window === "undefined") return;
+  const full: SavePayload = { ...payload, version: SAVE_VERSION, savedAt: Date.now(), label: "Auto-backup" };
+  try {
+    localStorage.setItem(BACKUP_KEY, JSON.stringify(full));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function readBackup(): SavePayload | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(BACKUP_KEY);
+    return raw ? (JSON.parse(raw) as SavePayload) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function normalizePayload(raw: unknown): SavePayload | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const incoming = (obj.state ?? obj) as Partial<GameState> | undefined;
+  if (!incoming || typeof incoming !== "object" || typeof (incoming as GameState).matter !== "number") return null;
+  const state: GameState = {
+    ...INITIAL_STATE,
+    ...(incoming as GameState),
+    upgrades: { ...INITIAL_STATE.upgrades, ...((incoming as GameState).upgrades ?? {}) },
+    prestigeUpgrades: (incoming as GameState).prestigeUpgrades ?? [],
+  };
+  return {
+    version: typeof obj.version === "number" ? (obj.version as number) : 1,
+    savedAt: typeof obj.savedAt === "number" ? (obj.savedAt as number) : Date.now(),
+    label: typeof obj.label === "string" ? (obj.label as string) : undefined,
+    state,
+    achievements: Array.isArray(obj.achievements) ? (obj.achievements as string[]) : [],
+    achievementsTs: (obj.achievementsTs as Record<string, number>) ?? {},
+    startTime: typeof obj.startTime === "number" ? (obj.startTime as number) : Date.now(),
+  };
 }
