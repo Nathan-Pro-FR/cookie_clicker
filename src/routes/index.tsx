@@ -1,24 +1,36 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast, Toaster } from "sonner";
 import { Singularity } from "@/components/Singularity";
 import { Shop } from "@/components/Shop";
 import { Prestige } from "@/components/Prestige";
-import { OfflineModal, SummaryModal } from "@/components/Modals";
+import { OfflineModal, SummaryModal, type AchievementMeta } from "@/components/Modals";
 import {
   INITIAL_STATE,
+  NUM_SLOTS,
   PRESTIGE_UPGRADES,
+  SAVE_VERSION,
   UPGRADES,
   computeClickPower,
   computeCps,
+  cpsBreakdown,
   costOf,
+  deleteSlot,
   formatNumber,
+  listSlots,
   loadState,
+  normalizePayload,
+  readBackup,
+  readSlot,
   resetSave,
   saveState,
   shardsAvailable,
+  snapshotBackup,
+  writeSlot,
+  type CpsContribution,
   type GameState,
   type PrestigeUpgradeId,
+  type SavePayload,
   type UpgradeId,
 } from "@/lib/game";
 
@@ -38,55 +50,81 @@ interface Achievement {
   id: string;
   name: string;
   description: string;
-  check: (s: GameState) => boolean;
+  current: (s: GameState) => number;
+  target: number;
 }
 
 const ACHIEVEMENTS: Achievement[] = [
-  { id: "first-click", name: "Premier Contact", description: "Vous avez touché l'inconnu.", check: (s) => s.clicks >= 1 },
-  { id: "hundred-clicks", name: "Doigt Quantique", description: "100 interactions.", check: (s) => s.clicks >= 100 },
-  { id: "thousand-clicks", name: "Frénésie Tachyonique", description: "1 000 clics.", check: (s) => s.clicks >= 1_000 },
-  { id: "thousand", name: "Poussière d'Étoiles", description: "1K de matière noire.", check: (s) => s.totalMatterAllTime >= 1_000 },
-  { id: "ten-k", name: "Nuage Moléculaire", description: "10K accumulés.", check: (s) => s.totalMatterAllTime >= 10_000 },
-  { id: "hundred-k", name: "Nébuleuse", description: "100K accumulés.", check: (s) => s.totalMatterAllTime >= 100_000 },
-  { id: "million", name: "Singularité Stable", description: "1M — ascension disponible.", check: (s) => s.totalMatterAllTime >= 1_000_000 },
-  { id: "billion", name: "Maître du Cosmos", description: "1B de matière.", check: (s) => s.totalMatterAllTime >= 1_000_000_000 },
-  { id: "trillion", name: "Architecte Galactique", description: "1T de matière.", check: (s) => s.totalMatterAllTime >= 1_000_000_000_000 },
-  { id: "first-prestige", name: "Big Bang", description: "Premier univers réinitialisé.", check: (s) => s.prestigeCount >= 1 },
-  { id: "five-prestige", name: "Multivers", description: "Cinq ascensions accomplies.", check: (s) => s.prestigeCount >= 5 },
-  { id: "ten-prestige", name: "Maître du Temps", description: "Dix ascensions.", check: (s) => s.prestigeCount >= 10 },
-  { id: "shards-10", name: "Collectionneur", description: "10 éclats cosmiques détenus.", check: (s) => s.shards >= 10 },
-  { id: "shards-100", name: "Gardien des Éclats", description: "100 éclats détenus.", check: (s) => s.shards >= 100 },
-  { id: "all-modules", name: "Collection Complète", description: "Tous les modules débloqués.", check: (s) => UPGRADES.every((u) => s.upgrades[u.id] > 0) },
-  { id: "module-50", name: "Industrialisation", description: "50 exemplaires d'un même module.", check: (s) => UPGRADES.some((u) => s.upgrades[u.id] >= 50) },
-  { id: "all-prestige", name: "Arbre Achevé", description: "Tout l'arbre temporel acquis.", check: (s) => PRESTIGE_UPGRADES.every((p) => s.prestigeUpgrades.includes(p.id)) },
+  { id: "first-click", name: "Premier Contact", description: "Vous avez touché l'inconnu.", current: (s) => s.clicks, target: 1 },
+  { id: "hundred-clicks", name: "Doigt Quantique", description: "100 interactions.", current: (s) => s.clicks, target: 100 },
+  { id: "thousand-clicks", name: "Frénésie Tachyonique", description: "1 000 clics.", current: (s) => s.clicks, target: 1_000 },
+  { id: "thousand", name: "Poussière d'Étoiles", description: "1K de matière noire.", current: (s) => s.totalMatterAllTime, target: 1_000 },
+  { id: "ten-k", name: "Nuage Moléculaire", description: "10K accumulés.", current: (s) => s.totalMatterAllTime, target: 10_000 },
+  { id: "hundred-k", name: "Nébuleuse", description: "100K accumulés.", current: (s) => s.totalMatterAllTime, target: 100_000 },
+  { id: "million", name: "Singularité Stable", description: "1M — ascension disponible.", current: (s) => s.totalMatterAllTime, target: 1_000_000 },
+  { id: "billion", name: "Maître du Cosmos", description: "1B de matière.", current: (s) => s.totalMatterAllTime, target: 1_000_000_000 },
+  { id: "trillion", name: "Architecte Galactique", description: "1T de matière.", current: (s) => s.totalMatterAllTime, target: 1_000_000_000_000 },
+  { id: "first-prestige", name: "Big Bang", description: "Premier univers réinitialisé.", current: (s) => s.prestigeCount, target: 1 },
+  { id: "five-prestige", name: "Multivers", description: "Cinq ascensions accomplies.", current: (s) => s.prestigeCount, target: 5 },
+  { id: "ten-prestige", name: "Maître du Temps", description: "Dix ascensions.", current: (s) => s.prestigeCount, target: 10 },
+  { id: "shards-10", name: "Collectionneur", description: "10 éclats cosmiques détenus.", current: (s) => s.shards, target: 10 },
+  { id: "shards-100", name: "Gardien des Éclats", description: "100 éclats détenus.", current: (s) => s.shards, target: 100 },
+  { id: "all-modules", name: "Collection Complète", description: "Tous les modules débloqués.", current: (s) => UPGRADES.filter((u) => s.upgrades[u.id] > 0).length, target: UPGRADES.length },
+  { id: "module-50", name: "Industrialisation", description: "50 exemplaires d'un même module.", current: (s) => Math.max(0, ...UPGRADES.map((u) => s.upgrades[u.id])), target: 50 },
+  { id: "all-prestige", name: "Arbre Achevé", description: "Tout l'arbre temporel acquis.", current: (s) => s.prestigeUpgrades.length, target: PRESTIGE_UPGRADES.length },
 ];
 
 const ACH_KEY = "cosmic-singularity-achievements-v1";
+const ACH_TS_KEY = "cosmic-singularity-achievements-ts-v1";
 const START_KEY = "cosmic-singularity-start-v1";
 
 function GamePage() {
   const [state, setState] = useState<GameState>(INITIAL_STATE);
   const [hydrated, setHydrated] = useState(false);
   const [achievements, setAchievements] = useState<string[]>([]);
-  const [offline, setOffline] = useState<{ gain: number; seconds: number } | null>(null);
+  const [achievementsTs, setAchievementsTs] = useState<Record<string, number>>({});
+  const [offline, setOffline] = useState<{ gain: number; seconds: number; breakdown: CpsContribution[]; totalCps: number } | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [startTime, setStartTime] = useState<number>(Date.now());
+  const [slots, setSlots] = useState(() => (typeof window !== "undefined" ? listSlots() : []));
+  const [backup, setBackup] = useState<SavePayload | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
   const achRef = useRef<Set<string>>(new Set());
+  const achTsRef = useRef<Record<string, number>>({});
+  const startRef = useRef<number>(startTime);
+  startRef.current = startTime;
+
+  const refreshSlots = useCallback(() => {
+    setSlots(listSlots());
+    setBackup(readBackup());
+  }, []);
+
+  const currentPayload = useCallback((): Omit<SavePayload, "version" | "savedAt"> => ({
+    state: stateRef.current,
+    achievements: Array.from(achRef.current),
+    achievementsTs: { ...achTsRef.current },
+    startTime: startRef.current,
+  }), []);
+
+  const takeBackup = useCallback((label: string) => {
+    snapshotBackup({ ...currentPayload(), label });
+    setBackup(readBackup());
+  }, [currentPayload]);
 
   // Hydrate
   useEffect(() => {
     const loaded = loadState();
     const elapsed = Math.min(60 * 60 * 4, (Date.now() - (loaded.lastSave || Date.now())) / 1000);
     if (elapsed > 10) {
-      const cps = computeCps(loaded);
-      const gain = cps * elapsed * 0.5;
+      const totalCps = computeCps(loaded);
+      const gain = totalCps * elapsed * 0.5;
       if (gain > 0) {
+        const breakdown = cpsBreakdown(loaded);
         loaded.matter += gain;
         loaded.totalMatter += gain;
         loaded.totalMatterAllTime += gain;
-        setOffline({ gain, seconds: elapsed });
+        setOffline({ gain, seconds: elapsed, breakdown, totalCps });
       }
     }
     try {
@@ -95,6 +133,12 @@ function GamePage() {
         const arr = JSON.parse(rawAch) as string[];
         achRef.current = new Set(arr);
         setAchievements(arr);
+      }
+      const rawTs = localStorage.getItem(ACH_TS_KEY);
+      if (rawTs) {
+        const obj = JSON.parse(rawTs) as Record<string, number>;
+        achTsRef.current = obj;
+        setAchievementsTs(obj);
       }
       const rawStart = localStorage.getItem(START_KEY);
       if (rawStart) setStartTime(parseInt(rawStart, 10));
@@ -108,7 +152,8 @@ function GamePage() {
     }
     setState(loaded);
     setHydrated(true);
-  }, []);
+    refreshSlots();
+  }, [refreshSlots]);
 
   // Tick
   useEffect(() => {
@@ -116,8 +161,8 @@ function GamePage() {
     const tickMs = 100;
     const id = setInterval(() => {
       setState((s) => {
-        const cps = computeCps(s);
-        const gain = (cps * tickMs) / 1000;
+        const c = computeCps(s);
+        const gain = (c * tickMs) / 1000;
         if (gain <= 0) return s;
         return {
           ...s,
@@ -146,9 +191,11 @@ function GamePage() {
   useEffect(() => {
     if (!hydrated) return;
     let changed = false;
+    const now = Date.now();
     for (const a of ACHIEVEMENTS) {
-      if (!achRef.current.has(a.id) && a.check(state)) {
+      if (!achRef.current.has(a.id) && a.current(state) >= a.target) {
         achRef.current.add(a.id);
+        achTsRef.current[a.id] = now;
         toast(`✦ ${a.name}`, { description: a.description });
         changed = true;
       }
@@ -156,7 +203,11 @@ function GamePage() {
     if (changed) {
       const arr = Array.from(achRef.current);
       setAchievements(arr);
-      try { localStorage.setItem(ACH_KEY, JSON.stringify(arr)); } catch { /* ignore */ }
+      setAchievementsTs({ ...achTsRef.current });
+      try {
+        localStorage.setItem(ACH_KEY, JSON.stringify(arr));
+        localStorage.setItem(ACH_TS_KEY, JSON.stringify(achTsRef.current));
+      } catch { /* ignore */ }
     }
   }, [state, hydrated]);
 
@@ -185,20 +236,25 @@ function GamePage() {
     });
   }, []);
 
+  // Ascension inversée : conserve modules, clics, prestige tree.
+  // Seuls la matière du cycle est remise à zéro ; les éclats s'ajoutent.
   const onAscend = useCallback(() => {
+    takeBackup("Avant ascension");
     setState((s) => {
       const pending = shardsAvailable(s.totalMatterAllTime, s.prestigeUpgrades);
       if (pending <= 0) return s;
-      toast(`✦ Big Bang — +${pending} Éclats Cosmiques`, { description: "Un nouvel univers commence." });
+      toast(`✦ Big Bang — +${pending} Éclats Cosmiques`, { description: "Modules conservés, cycle réinitialisé." });
       return {
-        ...INITIAL_STATE,
-        shards: s.shards + pending,
-        prestigeUpgrades: s.prestigeUpgrades,
-        prestigeCount: s.prestigeCount + 1,
+        ...s,
+        matter: 0,
+        totalMatter: 0,
         totalMatterAllTime: 0,
+        shards: s.shards + pending,
+        prestigeCount: s.prestigeCount + 1,
+        // upgrades, clicks, prestigeUpgrades, startTime conservés
       };
     });
-  }, []);
+  }, [takeBackup]);
 
   const onBuyPrestige = useCallback((id: PrestigeUpgradeId) => {
     setState((s) => {
@@ -215,38 +271,34 @@ function GamePage() {
 
   const onHardReset = useCallback(() => {
     if (typeof window === "undefined") return;
-    if (!window.confirm("Effacer toute progression et redémarrer ? Cette action est irréversible.")) return;
+    if (!window.confirm("Effacer toute progression (les slots restent intacts) ? Cette action est irréversible.")) return;
+    takeBackup("Avant réinitialisation");
     resetSave();
     try {
       localStorage.removeItem(ACH_KEY);
+      localStorage.removeItem(ACH_TS_KEY);
       localStorage.removeItem(START_KEY);
     } catch { /* ignore */ }
     achRef.current = new Set();
+    achTsRef.current = {};
     setAchievements([]);
+    setAchievementsTs({});
     const now = Date.now();
     setStartTime(now);
     try { localStorage.setItem(START_KEY, String(now)); } catch { /* ignore */ }
     setState(INITIAL_STATE);
     setSummaryOpen(false);
     toast("Univers réinitialisé.");
-  }, []);
+  }, [takeBackup]);
 
-  const onExport = useCallback(() => {
+  const downloadPayload = useCallback((payload: SavePayload, suffix: string) => {
     try {
-      saveState(stateRef.current);
-      const payload = {
-        version: 1,
-        state: stateRef.current,
-        achievements: Array.from(achRef.current),
-        startTime,
-        exportedAt: Date.now(),
-      };
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       a.href = url;
-      a.download = `cosmic-singularity-save-${stamp}.json`;
+      a.download = `cosmic-singularity-${suffix}-${stamp}.json`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -255,43 +307,105 @@ function GamePage() {
     } catch {
       toast("Échec de l'export.");
     }
-  }, [startTime]);
+  }, []);
+
+  const onExport = useCallback(() => {
+    saveState(stateRef.current);
+    downloadPayload(
+      { ...currentPayload(), version: SAVE_VERSION, savedAt: Date.now() },
+      "save",
+    );
+  }, [currentPayload, downloadPayload]);
+
+  const applyPayload = useCallback((p: SavePayload) => {
+    achRef.current = new Set(p.achievements);
+    achTsRef.current = { ...p.achievementsTs };
+    setAchievements(p.achievements);
+    setAchievementsTs(p.achievementsTs);
+    setStartTime(p.startTime);
+    setState(p.state);
+    saveState(p.state);
+    try {
+      localStorage.setItem(ACH_KEY, JSON.stringify(p.achievements));
+      localStorage.setItem(ACH_TS_KEY, JSON.stringify(p.achievementsTs));
+      localStorage.setItem(START_KEY, String(p.startTime));
+    } catch { /* ignore */ }
+  }, []);
 
   const onImport = useCallback((raw: string) => {
     try {
       const parsed = JSON.parse(raw);
-      const incoming: GameState | undefined = parsed?.state ?? parsed;
-      if (!incoming || typeof incoming !== "object" || typeof (incoming as GameState).matter !== "number") {
+      const payload = normalizePayload(parsed);
+      if (!payload) {
         toast("Fichier invalide.");
         return;
       }
-      const merged: GameState = {
-        ...INITIAL_STATE,
-        ...(incoming as GameState),
-        upgrades: { ...INITIAL_STATE.upgrades, ...((incoming as GameState).upgrades ?? {}) },
-        prestigeUpgrades: (incoming as GameState).prestigeUpgrades ?? [],
-      };
-      const ach: string[] = Array.isArray(parsed?.achievements) ? parsed.achievements : [];
-      achRef.current = new Set(ach);
-      setAchievements(ach);
-      try {
-        localStorage.setItem(ACH_KEY, JSON.stringify(ach));
-        if (parsed?.startTime) {
-          localStorage.setItem(START_KEY, String(parsed.startTime));
-          setStartTime(parsed.startTime);
-        }
-      } catch { /* ignore */ }
-      setState(merged);
-      saveState(merged);
+      if (!window.confirm(`Importer cette sauvegarde (v${payload.version}, ${new Date(payload.savedAt).toLocaleString()}) ?\nUn snapshot de l'état actuel sera créé.`)) return;
+      takeBackup("Avant import");
+      applyPayload(payload);
       toast("Sauvegarde importée.");
       setSummaryOpen(false);
     } catch {
       toast("Impossible de lire le fichier.");
     }
-  }, []);
+  }, [applyPayload, takeBackup]);
+
+  const onSaveSlot = useCallback((i: number) => {
+    const existing = readSlot(i);
+    if (existing && !window.confirm(`Écraser le Slot ${i + 1} ?`)) return;
+    writeSlot(i, { ...currentPayload(), label: `Slot ${i + 1}` });
+    refreshSlots();
+    toast(`Sauvegardé dans le Slot ${i + 1}.`);
+  }, [currentPayload, refreshSlots]);
+
+  const onLoadSlot = useCallback((i: number) => {
+    const p = readSlot(i);
+    if (!p) return;
+    if (!window.confirm(`Charger le Slot ${i + 1} ? Un snapshot de l'état actuel sera créé pour restauration.`)) return;
+    takeBackup(`Avant chargement Slot ${i + 1}`);
+    applyPayload(p);
+    refreshSlots();
+    toast(`Slot ${i + 1} chargé.`);
+  }, [applyPayload, refreshSlots, takeBackup]);
+
+  const onDeleteSlot = useCallback((i: number) => {
+    if (!window.confirm(`Vider le Slot ${i + 1} ?`)) return;
+    deleteSlot(i);
+    refreshSlots();
+  }, [refreshSlots]);
+
+  const onExportSlot = useCallback((i: number) => {
+    const p = readSlot(i);
+    if (!p) return;
+    downloadPayload(p, `slot-${i + 1}`);
+  }, [downloadPayload]);
+
+  const onRestoreBackup = useCallback(() => {
+    const b = readBackup();
+    if (!b) return;
+    if (!window.confirm(`Restaurer le snapshot du ${new Date(b.savedAt).toLocaleString()} ?`)) return;
+    applyPayload(b);
+    toast("Snapshot restauré.");
+  }, [applyPayload]);
 
   const cps = computeCps(state);
   const clickPower = computeClickPower(state);
+
+  const achievementsMeta = useMemo<AchievementMeta[]>(
+    () => ACHIEVEMENTS.map((a) => {
+      const unlocked = achievements.includes(a.id);
+      return {
+        id: a.id,
+        name: a.name,
+        description: a.description,
+        current: Math.min(a.target, a.current(state)),
+        target: a.target,
+        unlocked,
+        unlockedAt: achievementsTs[a.id],
+      };
+    }),
+    [state, achievements, achievementsTs],
+  );
 
   return (
     <main className="min-h-screen w-full px-4 py-6 lg:px-8">
@@ -305,17 +419,26 @@ function GamePage() {
         open={!!offline}
         gain={offline?.gain ?? 0}
         seconds={offline?.seconds ?? 0}
+        breakdown={offline?.breakdown ?? []}
+        totalCps={offline?.totalCps ?? 0}
         onClose={() => setOffline(null)}
       />
       <SummaryModal
         open={summaryOpen}
         state={state}
         startTime={startTime}
-        achievements={achievements}
+        achievementsMeta={achievementsMeta}
+        slots={slots}
+        backup={backup}
         onClose={() => setSummaryOpen(false)}
         onExport={onExport}
         onImport={onImport}
         onReset={onHardReset}
+        onSaveSlot={onSaveSlot}
+        onLoadSlot={onLoadSlot}
+        onDeleteSlot={onDeleteSlot}
+        onExportSlot={onExportSlot}
+        onRestoreBackup={onRestoreBackup}
       />
 
       <header className="flex flex-wrap items-end justify-between gap-4 mb-6">
@@ -331,7 +454,7 @@ function GamePage() {
           <Stat label="Clic" value={`+${formatNumber(clickPower)}`} accent="gold" />
           <Stat label="Éclats" value={`✦ ${formatNumber(state.shards)}`} accent="gold" />
           <button
-            onClick={() => setSummaryOpen(true)}
+            onClick={() => { refreshSlots(); setSummaryOpen(true); }}
             className="glass-panel rounded-xl px-3 py-2 cursor-pointer hover:bg-violet-neon/10 transition-colors"
             title="Résumé & sauvegarde"
             aria-label="Ouvrir le résumé"
@@ -343,12 +466,10 @@ function GamePage() {
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_1.4fr_1fr] gap-4 lg:gap-6 lg:h-[calc(100vh-180px)]">
-        {/* Left col (desktop): Prestige — Mobile: last */}
         <section className="order-3 lg:order-1 lg:min-h-0">
           <Prestige state={state} onAscend={onAscend} onBuyPrestige={onBuyPrestige} />
         </section>
 
-        {/* Center: Singularity */}
         <section className="order-1 lg:order-2 flex flex-col items-center justify-center gap-4 glass-panel rounded-2xl py-8">
           <Singularity onClick={onClick} cps={cps} />
           <div className="text-center">
@@ -360,16 +481,15 @@ function GamePage() {
           </div>
         </section>
 
-        {/* Right col (desktop): Shop — Mobile: directly under singularity */}
         <section className="order-2 lg:order-3 lg:min-h-0">
           <Shop state={state} onBuy={onBuy} />
         </section>
       </div>
 
       <footer className="mt-6 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
-        <span>Sauvegarde automatique · LocalStorage</span>
+        <span>Sauvegarde auto · {NUM_SLOTS} slots disponibles</span>
         <button
-          onClick={() => setSummaryOpen(true)}
+          onClick={() => { refreshSlots(); setSummaryOpen(true); }}
           className="hover:text-violet-neon transition-colors cursor-pointer"
         >
           Codex & sauvegardes
